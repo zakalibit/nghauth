@@ -1,0 +1,4 @@
+Flask==2.3.2
+python-pam==2.0.2
+six==1.16.0
+Werkzeug==2.3.4

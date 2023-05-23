@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import pwd
+import grp
+import pam
+import json
+import platform
+import logging
+from datetime import timedelta
+from functools import wraps
+from flask import Flask, request, Response, session
+
+
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(name)s %(levelname)s %(message)s')
+logger = logging.getLogger('pam.auth')
+
+app = Flask(__name__)
+app.config.from_object(__name__)
+
+
+'''
+PAM Auth Request Service.
+Used for NGINX ngx_http_auth_request_module
+http://nginx.org/en/docs/http/ngx_http_auth_request_module.html
+
+Sample nginx config:
+
+  ## just add auth_request /pam_auth; to any location
+  location = /pam_auth {
+    internal;
+    proxy_pass              http://localhost:3043;
+    proxy_pass_request_body off;
+    proxy_set_header        Content-Length "";
+    proxy_set_header        X-Original-URI $request_uri;
+    proxy_cookie_domain     localhost <nginx_configured_hostname>;
+    proxy_cookie_domain     <nginx_configured_hostname> localhost;
+  }
+
+
+  location ^~ /<prefix> {
+    auth_request /pam_auth;
+    ...
+  }
+
+
+Run PAM Auth Request:
+ $ ./authpam
+'''
+
+
+def get_user_group(username: str) -> grp.struct_group:
+    try:
+        ugid = pwd.getpwnam(username).pw_gid
+        group = grp.getgrgid(ugid)
+        return group
+    except Exception as e:
+        logger.error('get_user_groups({}) - failed, reason: {}'.format(username, str(e)))
+    return None
+
+
+def checkuser(username: str, cfg_groups) -> bool:
+    group = get_user_group(username)
+    if not group:
+        return False
+
+    gr_name = group.gr_name
+    # auth against configured groups
+    return (gr_name in cfg_groups) and (not len(cfg_groups[gr_name]) or username in cfg_groups[gr_name])
+
+
+def auth_pam(username: str, password: str) -> bool:
+    if pam.pam().authenticate(username, password):
+        session['username'] = username
+        session.modified = True
+        return True
+    return False
+
+
+def check_auth(username: str, password: str, auth_config: dict = None) -> bool:
+    if auth_config and 'groups' in auth_config and not checkuser(username, auth_config['groups']):
+        return False
+    return auth_pam(username, password)
+
+
+def auth401():
+    """Sends a 401 response that enables basic auth"""
+    return Response('Could not verify your access level for that URL.\n'
+                    'You have to login with proper credentials', 401,
+                    {'WWW-Authenticate': 'Basic realm="Login Required"'})
+
+
+def get_auth_config():
+    if os.path.isfile('.authpam'):
+        with open('.authpam', 'r') as f:
+            return json.load(f)
+
+
+class authenticate(object):
+
+    def __init__(self, flask_app):
+        self.app = flask_app
+        self.auth_config = get_auth_config()
+
+    def __call__(self, f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if 'username' not in session:
+                auth = request.authorization
+                if not auth or not check_auth(auth.username, auth.password, self.auth_config):
+                    return auth401()
+            return f(*args, **kwargs)
+        return decorated
+
+
+requires_auth = authenticate(app)
+
+
+@app.route('/auth')
+@requires_auth
+def auth():
+    return Response('', 200)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='PAM Auth Service.')
+    parser.add_argument('-p', dest='port', type=int, default=3043, help='PAM Auth Service listening port.')
+    parser.add_argument('-s', dest='host', type=str, default='127.0.0.1', help='PAM Auth Service host.')
+
+    args = parser.parse_args()
+
+    app.secret_key = open('/dev/random', 'rb').read(16)
+
+    app.config.update(SESSION_COOKIE_NAME='authpam_{}_{}'.format(platform.node(), args.port),
+                      PERMANENT_SESSION_LIFETIME=timedelta(hours=12))  # 12 hours
+
+    app.run(host=args.host, port=args.port, threaded=True)
